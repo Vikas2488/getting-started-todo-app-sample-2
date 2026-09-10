@@ -1,21 +1,103 @@
-name: Docker Build
+name: CI/CD
 
 on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
 
 jobs:
-  docker-build:
+
+  test:
+    name: Test
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t getting-started-todo-app .
+      - name: Build test stage
+        run: |
+          docker build \
+            --target test \
+            -t todo-test .
 
+  security:
+    name: Trivy Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build production image
+        run: |
+          docker build \
+            --target final \
+            -t todo-app:${{ github.sha }} .
+
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: todo-app:${{ github.sha }}
+          format: table
+          exit-code: 1
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+  build-push:
+    name: Build and Push
+    runs-on: ubuntu-latest
+    needs: security
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          docker build \
+            --target final \
+            -t ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:${{ github.sha }} \
+            -t ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:latest .
+
+      - name: Push images
+        run: |
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:${{ github.sha }}
+          docker push ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:latest
+
+  deploy:
+    name: Deploy to AWS EC2
+    runs-on: ubuntu-latest
+    needs: build-push
+
+    steps:
+      - name: Deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd ~/todo-app
+
+            docker login \
+              -u "${{ secrets.DOCKERHUB_USERNAME }}" \
+              -p "${{ secrets.DOCKERHUB_TOKEN }}"
+
+            docker pull \
+              "${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:latest"
+
+            sed -i \
+              "s|^IMAGE_NAME=.*|IMAGE_NAME=${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:latest|" \
+              .env
+
+            docker compose up -d
+
+            docker image prune -f
