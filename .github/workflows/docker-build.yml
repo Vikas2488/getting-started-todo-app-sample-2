@@ -10,9 +10,9 @@ permissions:
 
 jobs:
 
-  # ==================================================
+  # ==========================================
   # TEST
-  # ==================================================
+  # ==========================================
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -21,15 +21,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build test stage
+      - name: Build test image
         run: |
           docker build \
             --target test \
             -t todo-test .
 
-  # ==================================================
+  # ==========================================
   # SECURITY SCAN
-  # ==================================================
+  # ==========================================
   security:
     name: Trivy Security Scan
     runs-on: ubuntu-latest
@@ -46,17 +46,18 @@ jobs:
             -t todo-app:${{ github.sha }} .
 
       - name: Run Trivy
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: todo-app:${{ github.sha }}
-          format: table
-          exit-code: '0'
-          ignore-unfixed: true
-          severity: CRITICAL,HIGH
+        run: |
+          docker run --rm \
+            aquasec/trivy:latest \
+            image \
+            --exit-code 0 \
+            --ignore-unfixed \
+            --severity CRITICAL,HIGH \
+            todo-app:${{ github.sha }}
 
-  # ==================================================
+  # ==========================================
   # BUILD AND PUSH
-  # ==================================================
+  # ==========================================
   build-push:
     name: Build and Push
     runs-on: ubuntu-latest
@@ -79,7 +80,7 @@ jobs:
             -t ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:${{ github.sha }} \
             -t ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:latest .
 
-      - name: Push image with commit tag
+      - name: Push commit image
         run: |
           docker push \
             ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:${{ github.sha }}
@@ -89,9 +90,9 @@ jobs:
           docker push \
             ${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:latest
 
-  # ==================================================
-  # DEPLOY TO AWS EC2
-  # ==================================================
+  # ==========================================
+  # DEPLOY TO EC2
+  # ==========================================
   deploy:
     name: Deploy to AWS EC2
     runs-on: ubuntu-latest
@@ -101,21 +102,42 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # -----------------------------------------------
-      # Copy Compose and Nginx configuration
-      # -----------------------------------------------
-      - name: Copy deployment files to EC2
+      # Create directories on EC2
+      - name: Prepare EC2 directory
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            mkdir -p /home/ubuntu/todo-app/nginx
+            mkdir -p /home/ubuntu/todo-app
+
+            echo "EC2 deployment directories ready"
+
+      # Copy compose.yml
+      - name: Copy compose.yml
         uses: appleboy/scp-action@v1
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}
-          source: "compose.yml,deploy/nginx/default.conf"
+          source: "compose.yml"
           target: "/home/ubuntu/todo-app"
 
-      # -----------------------------------------------
-      # Deploy
-      # -----------------------------------------------
+      # Copy nginx configuration
+      - name: Copy Nginx configuration
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "deploy/nginx/default.conf"
+          target: "/home/ubuntu/todo-app/nginx"
+
+      # Deploy application
       - name: Deploy application
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -130,23 +152,33 @@ jobs:
             echo "Starting deployment"
             echo "======================================"
 
-            cd ~/todo-app
+            cd /home/ubuntu/todo-app
 
-            # Create Nginx directory
-            mkdir -p nginx
+            echo "Checking deployment files..."
 
-            # Move copied Nginx configuration
-            if [ -f deploy/nginx/default.conf ]; then
-              cp deploy/nginx/default.conf nginx/default.conf
-            fi
+            ls -la
+            echo ""
+            echo "Nginx directory:"
+            ls -la nginx
 
-            # Create environment file
+            echo ""
+            echo "Checking compose.yml..."
+
+            test -f compose.yml
+            test -f nginx/default.conf
+
+            echo "Files found"
+
+            # Create .env
             cat > .env <<EOF
             IMAGE_NAME=${{ secrets.DOCKERHUB_USERNAME }}/aws-devops-todo:latest
             MYSQL_PASSWORD=${{ secrets.MYSQL_PASSWORD }}
             EOF
 
-            echo "Environment file created"
+            echo ".env created"
+
+            # Validate environment variables
+            test -n "${{ secrets.MYSQL_PASSWORD }}"
 
             # Login to Docker Hub
             echo "${{ secrets.DOCKERHUB_TOKEN }}" | \
@@ -156,18 +188,42 @@ jobs:
 
             echo "Docker Hub login successful"
 
-            # Pull latest images
+            # Validate Docker Compose file
+            echo "Validating Docker Compose..."
+
+            docker compose config -q
+
+            echo "Docker Compose configuration is valid"
+
+            # Pull images
+            echo "Pulling Docker images..."
+
             docker compose pull
 
-            # Start / recreate services
-            docker compose up -d
+            # Start services
+            echo "Starting services..."
 
-            # Show running containers
+            docker compose up -d --remove-orphans
+
+            # Show status
+            echo ""
+            echo "Container status:"
+
             docker compose ps
 
-            # Remove unused Docker images
+            # Show logs if something failed
+            echo ""
+            echo "Checking container health..."
+
+            if ! docker compose ps --status running | grep -q "todo-app"; then
+              echo "WARNING: todo-app container may not be running"
+              docker compose logs --tail=50 app
+            fi
+
+            # Cleanup unused images
             docker image prune -f
 
+            echo ""
             echo "======================================"
             echo "Deployment completed"
             echo "======================================"
