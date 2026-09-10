@@ -99,4 +99,3 @@ COPY --from=client-build /usr/local/app/dist ./src/static
 EXPOSE 3000
 
 CMD ["node", "src/index.js"]
-```
